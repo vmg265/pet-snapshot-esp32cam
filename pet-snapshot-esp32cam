@@ -1,0 +1,417 @@
+#include <ArduinoJson.h>
+#include <UniversalTelegramBot.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+
+#include "esp_camera.h"
+#include "esp_http_server.h"
+#include "secrets.h"
+
+// AI-Thinker Camera Pin Map
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+#define FLASH_LED_PIN      4
+#define INDICATOR_LED_PIN 33
+
+#define PART_BOUNDARY "123456789000000000000987654321"
+
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+httpd_handle_t stream_httpd = NULL;
+bool is_streaming = false;
+bool camera_initialized = false;
+
+WiFiClientSecure clientTCP;
+UniversalTelegramBot bot(SECRET_BOT_TOKEN, clientTCP);
+const int botRequestDelay = 1000;
+unsigned long lastTimeBotRan = 0;
+
+static esp_err_t stream_handler(httpd_req_t *req) {
+  camera_fb_t *fb = NULL;
+  esp_err_t res = ESP_OK;
+  size_t jpg_buf_len = 0;
+  uint8_t *jpg_buf = NULL;
+  char part_buf[64];
+
+  res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+  if (res != ESP_OK) {
+    return res;
+  }
+
+  is_streaming = true;
+  while (true) {
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      res = ESP_FAIL;
+    } else {
+      jpg_buf_len = fb->len;
+      jpg_buf = fb->buf;
+    }
+
+    if (res == ESP_OK) {
+      size_t hlen = snprintf(part_buf, sizeof(part_buf), _STREAM_PART, jpg_buf_len);
+      res = httpd_resp_send_chunk(req, part_buf, hlen);
+    }
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, (const char*)jpg_buf, jpg_buf_len);
+    }
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+    }
+
+    if (fb) {
+      esp_camera_fb_return(fb);
+      fb = NULL;
+      jpg_buf = NULL;
+    }
+
+    if (res != ESP_OK) {
+      break;
+    }
+  }
+
+  is_streaming = false;
+  return res;
+}
+
+void startCameraServer() {
+  if (stream_httpd != NULL) return;
+
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+
+  httpd_uri_t stream_uri = {
+    .uri = "/",
+    .method = HTTP_GET,
+    .handler = stream_handler,
+    .user_ctx = NULL
+  };
+
+  if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(stream_httpd, &stream_uri);
+  }
+}
+
+void stopCameraServer() {
+  if (stream_httpd != NULL) {
+    httpd_stop(stream_httpd);
+    stream_httpd = NULL;
+  }
+}
+
+void updateLED() {
+  static unsigned long lastLedBlinkTime = 0;
+  static bool ledState = false;
+
+  bool wifiOk = (WiFi.status() == WL_CONNECTED);
+
+  if (!wifiOk) {
+    if (millis() - lastLedBlinkTime > 100) {
+      ledState = !ledState;
+      digitalWrite(INDICATOR_LED_PIN, ledState ? LOW : HIGH);
+      lastLedBlinkTime = millis();
+    }
+  } else if (!camera_initialized) {
+    if (millis() - lastLedBlinkTime > 1000) {
+      ledState = !ledState;
+      digitalWrite(INDICATOR_LED_PIN, ledState ? LOW : HIGH);
+      lastLedBlinkTime = millis();
+    }
+  } else {
+    digitalWrite(INDICATOR_LED_PIN, HIGH);
+  }
+}
+
+String sendPhotoTelegram() {
+  if (!camera_initialized) {
+    return "Camera init failed";
+  }
+
+  for (int b = 0; b < 3; b++) {
+    digitalWrite(FLASH_LED_PIN, HIGH);
+    unsigned long blinkStart = millis();
+    while (millis() - blinkStart < 200) {
+      updateLED();
+      delay(10);
+    }
+
+    digitalWrite(FLASH_LED_PIN, LOW);
+    blinkStart = millis();
+    while (millis() - blinkStart < 200) {
+      updateLED();
+      delay(10);
+    }
+  }
+
+  digitalWrite(FLASH_LED_PIN, HIGH);
+  unsigned long flashWaitStart = millis();
+  while (millis() - flashWaitStart < 1000) {
+    updateLED();
+    delay(10);
+  }
+
+  camera_fb_t *fb = NULL;
+  for (int i = 0; i < 3; i++) {
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      digitalWrite(FLASH_LED_PIN, LOW);
+      return "Camera capture failed";
+    }
+    if (i < 2) {
+      esp_camera_fb_return(fb);
+      fb = NULL;
+    }
+  }
+
+  digitalWrite(FLASH_LED_PIN, LOW);
+
+  if (WiFi.status() != WL_CONNECTED) {
+    esp_camera_fb_return(fb);
+    return "WiFi connection dropped";
+  }
+
+  WiFiClientSecure photoClient;
+  photoClient.setInsecure();
+  photoClient.setTimeout(20000);
+
+  const char *host = "api.telegram.org";
+  if (photoClient.connect(host, 443)) {
+    String head = "--BoundaryString\r\n"
+                  "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n" +
+                  SECRET_CHAT_ID +
+                  "\r\n--BoundaryString\r\n"
+                  "Content-Disposition: form-data; name=\"photo\"; filename=\"cam.jpg\"\r\n"
+                  "Content-Type: image/jpeg\r\n\r\n";
+    String tail = "\r\n--BoundaryString--\r\n";
+    uint32_t totalLen = fb->len + head.length() + tail.length();
+
+    photoClient.println("POST /bot" + SECRET_BOT_TOKEN + "/sendPhoto HTTP/1.1");
+    photoClient.println("Host: " + String(host));
+    photoClient.println("Content-Length: " + String(totalLen));
+    photoClient.println("Content-Type: multipart/form-data; boundary=BoundaryString");
+    photoClient.println();
+    photoClient.print(head);
+
+    uint8_t *fbBuf = fb->buf;
+    size_t fbLen = fb->len;
+    for (size_t n = 0; n < fbLen; n += 1024) {
+      if (n + 1024 < fbLen) {
+        photoClient.write(fbBuf, 1024);
+        fbBuf += 1024;
+      } else if (fbLen % 1024 > 0) {
+        photoClient.write(fbBuf, fbLen % 1024);
+      }
+    }
+
+    photoClient.print(tail);
+    esp_camera_fb_return(fb);
+
+    while (photoClient.available()) {
+      photoClient.readStringUntil('\n');
+    }
+    return "Success";
+  }
+
+  esp_camera_fb_return(fb);
+  return "Connection failed";
+}
+
+void handleNewMessages(int numNewMessages) {
+  for (int i = 0; i < numNewMessages; i++) {
+    String chat_id = String(bot.messages[i].chat_id);
+    String text = bot.messages[i].text;
+
+    Serial.println("Received msg from chat: " + chat_id + " - Text: " + text);
+
+    if (chat_id != SECRET_CHAT_ID) {
+      Serial.println("Ignoring unauthorized chat ID: " + chat_id);
+      continue;
+    }
+
+    if (text == "/debugmode" || text.startsWith("/debugmode@")) {
+      startCameraServer();
+      String ip = WiFi.localIP().toString();
+      bot.sendMessage(SECRET_CHAT_ID, "Debug mode started! Open http://" + ip + " for live stream.", "");
+    } else if (text == "/stopdebug" || text.startsWith("/stopdebug@")) {
+      stopCameraServer();
+      bot.sendMessage(SECRET_CHAT_ID, "Debug mode stopped.", "");
+    } else if (text == "/ip" || text.startsWith("/ip@")) {
+      String ip = WiFi.localIP().toString();
+      bot.sendMessage(SECRET_CHAT_ID, "Local IP: http://" + ip, "");
+    } else if (text.startsWith("/res ")) {
+      String res_str = text.substring(5);
+      res_str.trim();
+      res_str.toLowerCase();
+
+      sensor_t *s = esp_camera_sensor_get();
+      if (!s) {
+        bot.sendMessage(SECRET_CHAT_ID, "Camera sensor not found.", "");
+        continue;
+      }
+
+      if (res_str == "uxga")       s->set_framesize(s, FRAMESIZE_UXGA);
+      else if (res_str == "svga") s->set_framesize(s, FRAMESIZE_SVGA);
+      else if (res_str == "vga")  s->set_framesize(s, FRAMESIZE_VGA);
+      else if (res_str == "cif")  s->set_framesize(s, FRAMESIZE_CIF);
+      else if (res_str == "qvga") s->set_framesize(s, FRAMESIZE_QVGA);
+      else {
+        bot.sendMessage(SECRET_CHAT_ID, "Unknown resolution. Try: uxga, svga, vga, cif, qvga.", "");
+        continue;
+      }
+
+      bot.sendMessage(SECRET_CHAT_ID, "Resolution changed to " + res_str, "");
+    } else if (text == "/photo" || text.startsWith("/photo@")) {
+      if (is_streaming) {
+        bot.sendMessage(SECRET_CHAT_ID, "Stream is active. Close browser tab before taking a photo.", "");
+        continue;
+      }
+      if (!camera_initialized) {
+        bot.sendMessage(SECRET_CHAT_ID, "Camera error: hardware not initialized.", "");
+        continue;
+      }
+
+      bot.sendMessage(SECRET_CHAT_ID, "Capturing image, please wait...", "");
+      Serial.println("Taking photo...");
+
+      String result = sendPhotoTelegram();
+      if (result != "Success") {
+        bot.sendMessage(SECRET_CHAT_ID, "Error: " + result, "");
+      }
+      Serial.println("Result: " + result);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  clientTCP.setInsecure();
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 10000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = FRAMESIZE_SVGA;
+  config.jpeg_quality = 12;
+  config.fb_count = 1;
+
+  pinMode(FLASH_LED_PIN, OUTPUT);
+  digitalWrite(FLASH_LED_PIN, LOW);
+
+  pinMode(INDICATOR_LED_PIN, OUTPUT);
+  digitalWrite(INDICATOR_LED_PIN, HIGH);
+
+  delay(1000);
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x\n", err);
+  } else {
+    camera_initialized = true;
+    sensor_t *s = esp_camera_sensor_get();
+    if (s != NULL) {
+      s->set_brightness(s, 1);
+      s->set_saturation(s, 1);
+      s->set_aec2(s, 1);
+      s->set_vflip(s, 1);
+      s->set_hmirror(s, 1);
+    }
+  }
+
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(SECRET_SSID, SECRET_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    unsigned long waitStart = millis();
+    while (millis() - waitStart < 500) {
+      updateLED();
+      delay(10);
+    }
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+
+  configTime(0, 0, "pool.ntp.org");
+  Serial.print("Syncing time");
+  time_t now = time(nullptr);
+  while (now < 24 * 3600) {
+    Serial.print(".");
+    delay(100);
+    now = time(nullptr);
+  }
+  Serial.println("\nTime synced!");
+}
+
+void loop() {
+  updateLED();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected, reconnecting...");
+    WiFi.disconnect();
+    WiFi.begin(SECRET_SSID, SECRET_PASS);
+
+    unsigned long startAttemptTime = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
+      unsigned long waitStart = millis();
+      while (millis() - waitStart < 500) {
+        updateLED();
+        delay(10);
+      }
+      Serial.print(".");
+    }
+    Serial.println();
+
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi reconnect failed. Retrying later...");
+      unsigned long waitStart = millis();
+      while (millis() - waitStart < 2000) {
+        updateLED();
+        delay(10);
+      }
+      return;
+    }
+    Serial.println("WiFi reconnected.");
+  }
+
+  if (millis() > lastTimeBotRan + botRequestDelay) {
+    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    while (numNewMessages) {
+      handleNewMessages(numNewMessages);
+      numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    }
+    lastTimeBotRan = millis();
+  }
+}
