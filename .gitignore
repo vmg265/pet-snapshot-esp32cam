@@ -1,0 +1,15 @@
+# Credentials & sensitive files
+secrets.h
+
+# Arduino build artifacts
+build/
+*.bin
+*.elf
+*.hex
+
+# OS & Editor generated files
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
